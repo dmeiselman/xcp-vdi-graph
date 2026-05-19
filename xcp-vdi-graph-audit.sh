@@ -8,7 +8,9 @@
 # Run on the XCP-ng pool master. Bash 4+ required (dom0 ships it). Performs
 # only `xe *-list` / `*-param-get` reads — no state changes.
 
-set -u
+# Note: deliberately NOT using `set -u` — bash 4.2 (XCP-ng dom0) raises
+# "unbound variable" on `${!arr[@]}` / `${#arr[@]}` for empty associative
+# arrays, which several of our reverse-index maps legitimately are.
 
 if ! command -v xe >/dev/null 2>&1; then
   echo "xe not found — run this on an XCP-ng host." >&2
@@ -189,6 +191,19 @@ for u in "${!VDI_NAME[@]}"; do
     for vm in ${VDI_OWNER_VM[$u]:-}; do mark_vm "$vm" self_vhd_parent; done
   fi
 
+  if [[ -n $snapof && $snapof == "$u" ]]; then
+    add self_snapshot_of "$(vdi_label "$u") -- snapshot-of points to self"
+    for vm in ${VDI_OWNER_VM[$u]:-}; do mark_vm "$vm" self_snapshot_of; done
+  fi
+
+  if [[ -n $snapof && -n ${VDI_NAME[$snapof]:-} ]]; then
+    ssr=${VDI_SR[$snapof]:-}
+    if [[ $ssr != "$sr" ]]; then
+      add snap_of_cross_sr "$(vdi_label "$u") -- snapshot-of=$snapof lives in SR ${SR_NAME[$ssr]:-?} ($ssr); real snapshots stay in their source SR"
+      for vm in ${VDI_OWNER_VM[$u]:-}; do mark_vm "$vm" snap_of_cross_sr; done
+    fi
+  fi
+
   if [[ -n $vhdp && -n ${VDI_NAME[$vhdp]:-} ]]; then
     psr=${VDI_SR[$vhdp]:-}
     if [[ $psr != "$sr" ]]; then
@@ -258,6 +273,48 @@ for parent in "${!CHILDREN_BY_VHDPARENT[@]}"; do
   unset owners
 done
 
+# --- Corrupt-snapshot-root cluster pass ---
+# If one VDI is named as snapshot-of by VDIs that span unrelated owner VMs OR
+# span ISO+user SR types, the named target is almost certainly the corrupt root
+# (the symptom you described: one bad VDI "owns" ISOs and unrelated VMs' disks
+# as its snapshots).
+declare -A CORRUPT_ROOTS    # uuid -> child count
+for parent in "${!CHILDREN_BY_SNAPOF[@]}"; do
+  kids=(${CHILDREN_BY_SNAPOF[$parent]})
+  (( ${#kids[@]} < 2 )) && continue
+
+  declare -A owners=() srs=() srtypes=()
+  iso_kid=0 user_kid=0
+  for k in "${kids[@]}"; do
+    ksr=${VDI_SR[$k]:-}
+    srs[$ksr]=1
+    kst=${SR_TYPE[$ksr]:-}; ksc=${SR_CONTENT[$ksr]:-}
+    srtypes[${kst:-?}]=1
+    if [[ $kst == iso || $kst == udev || $ksc == iso ]]; then iso_kid=1; else user_kid=1; fi
+    for vm in ${VDI_OWNER_VM[$k]:-}; do owners[$vm]=1; done
+  done
+
+  reason=""
+  (( ${#owners[@]} > 1 )) && reason+="children belong to ${#owners[@]} unrelated VMs; "
+  (( iso_kid && user_kid )) && reason+="children mix ISO and user-disk SRs; "
+  (( ${#srs[@]} > 1 )) && reason+="children span ${#srs[@]} SRs; "
+
+  if [[ -n $reason ]]; then
+    target_desc="$parent"
+    if [[ -n ${VDI_NAME[$parent]:-} ]]; then
+      target_desc+=" [${VDI_NAME[$parent]}] (sr=${SR_NAME[${VDI_SR[$parent]:-}]:-?} type=${VDI_TYPE[$parent]:-?})"
+    else
+      target_desc+=" [NOT IN XAPI]"
+      [[ -n ${SR_NAME[$parent]:-} ]] && target_desc+=" <-- is SR ${SR_NAME[$parent]}"
+      [[ -n ${VM_NAME[$parent]:-} ]] && target_desc+=" <-- is VM ${VM_NAME[$parent]}"
+    fi
+    add corrupt_snapshot_root "$target_desc -- ${reason}${#kids[@]} children claim snapshot-of=$parent: ${kids[*]}"
+    CORRUPT_ROOTS[$parent]=${#kids[@]}
+    for o in "${!owners[@]}"; do mark_vm "$o" corrupt_snapshot_root; done
+  fi
+  unset owners srs srtypes
+done
+
 for b in "${!VBD_VM[@]}"; do
   vdi=${VBD_VDI[$b]:-}; empty=${VBD_EMPTY[$b]:-}; btype=${VBD_TYPE[$b]:-}
   [[ $btype == CD ]] && continue
@@ -290,7 +347,10 @@ done
 
 declare -A CAT_DESC=(
   [self_vhd_parent]="VDIs that list themselves as their own VHD parent"
+  [self_snapshot_of]="VDIs whose snapshot-of points to themselves"
+  [corrupt_snapshot_root]="Suspected corrupt root: one VDI is named as snapshot-of by VDIs spanning unrelated VMs / SR types"
   [vhd_parent_cross_sr]="VHD parent lives in a different SR (impossible)"
+  [snap_of_cross_sr]="snapshot-of points at a VDI in a different SR (impossible)"
   [vhd_parent_dangling]="VHD parent UUID not present in XAPI"
   [snap_without_target]="is-a-snapshot=true but snapshot-of empty"
   [snap_target_missing]="snapshot-of points at a UUID no longer in XAPI"
@@ -306,7 +366,7 @@ declare -A CAT_DESC=(
 )
 
 # Severity: things that actively break XOA's disk display come first
-SEVERITY_HIGH=(self_vhd_parent snap_attached_to_live_vm iso_flagged_snapshot chain_crossover vhd_parent_cross_sr)
+SEVERITY_HIGH=(corrupt_snapshot_root self_vhd_parent self_snapshot_of snap_attached_to_live_vm iso_flagged_snapshot chain_crossover vhd_parent_cross_sr snap_of_cross_sr)
 SEVERITY_MED=(vhd_parent_dangling snap_target_missing snap_without_target snap_of_a_snap vbd_dangling vm_snap_source_missing vm_snap_no_source vdi_missing)
 SEVERITY_LOW=(vbd_back_link_mismatch)
 
@@ -329,6 +389,21 @@ if (( TOTAL == 0 )); then
   echo "  No inconsistencies detected. Graph is internally consistent."
 else
   # Heuristic interpretations
+  if (( ${#CORRUPT_ROOTS[@]} > 0 )); then
+    echo "  - SUSPECTED CORRUPT ROOT(S): the following VDI UUID(s) are named as snapshot-of by VDIs spanning unrelated VMs / SR types:"
+    for r in "${!CORRUPT_ROOTS[@]}"; do
+      extra=""
+      [[ -n ${VDI_NAME[$r]:-} ]] && extra=" [${VDI_NAME[$r]}] (sr=${SR_NAME[${VDI_SR[$r]:-}]:-?})"
+      [[ -z ${VDI_NAME[$r]:-} && -n ${SR_NAME[$r]:-} ]] && extra=" <-- is actually SR ${SR_NAME[$r]}"
+      [[ -z ${VDI_NAME[$r]:-} && -n ${VM_NAME[$r]:-} ]] && extra=" <-- is actually VM ${VM_NAME[$r]}"
+      printf "      %s  (%d children claim it)%s\n" "$r" "${CORRUPT_ROOTS[$r]}" "$extra"
+    done
+    echo "    This matches the 'one bad VDI owns everything as its snapshots' pattern, often caused by an incomplete rolling-snapshot backup."
+  fi
+  if [[ -n ${FINDINGS[self_snapshot_of]:-} ]]; then
+    n=$(count_lines "${FINDINGS[self_snapshot_of]}")
+    echo "  - $n VDI(s) have snapshot-of pointing to themselves. Combined with mass-victim children, this is the smoking-gun for the failure mode you described."
+  fi
   if [[ -n ${FINDINGS[snap_target_missing]:-} ]]; then
     # Are most missing snapshot-of targets the same uuid?
     dup_target=$(printf '%s\n' "${FINDINGS[snap_target_missing]}" \
