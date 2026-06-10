@@ -199,7 +199,8 @@ def parse_xe_list(output: str) -> List[Dict[str, str]]:
                 current = {}
             continue
         # Match field lines: "field-name ( RO): value" or "field-name (MRO): value"
-        m = re.match(r'^(\S.*?)\s*\(\s*(?:RO|RW|MRO|MRW|SRO|SRW)\s*\)\s*:\s?(.*)', line)
+        # xe indents every field line except 'uuid' — must allow leading whitespace
+        m = re.match(r'^\s*(\S.*?)\s*\(\s*(?:RO|RW|MRO|MRW|SRO|SRW)\s*\)\s*:\s?(.*)', line)
         if m:
             key = m.group(1).strip()
             val = m.group(2).strip()
